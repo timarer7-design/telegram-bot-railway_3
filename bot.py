@@ -4,11 +4,11 @@ import logging
 import redis
 from datetime import datetime
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # ===================== НАСТРОЙКИ =====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
+UPSTASH_REDIS_URL = os.environ.get("UPSTASH_REDIS_URL")  # Из Railway Variables
 
 # Настройка логирования
 logging.basicConfig(
@@ -17,203 +17,444 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ===================== REDIS КЛИЕНТ =====================
-class RedisStorage:
+print("=" * 60)
+print("🤖 TELEGRAM BOT WITH UPSTASH REDIS")
+print("=" * 60)
+
+# ===================== UPSTASH REDIS МЕНЕДЖЕР =====================
+class UpstashRedisManager:
     def __init__(self, redis_url):
-        self.redis = redis.from_url(redis_url, decode_responses=True)
-        logger.info("✅ Redis подключен")
+        """Инициализация подключения к Upstash Redis"""
+        try:
+            # Подключаемся к Upstash Redis
+            self.redis = redis.from_url(
+                redis_url,
+                decode_responses=True,
+                socket_connect_timeout=5,
+                socket_keepalive=True
+            )
+            
+            # Проверяем подключение
+            self.redis.ping()
+            logger.info("✅ Успешное подключение к Upstash Redis")
+            print(f"🔗 Redis подключен: {redis_url.split('@')[1] if '@' in redis_url else redis_url}")
+            
+            # Проверяем лимиты Upstash
+            self.check_limits()
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка подключения к Redis: {e}")
+            self.redis = None
+            print("⚠️  Работаем без Redis (данные не сохранятся)")
     
-    def save_user_data(self, user_id, key, value):
+    def check_limits(self):
+        """Проверка лимитов Upstash (10K команд/день бесплатно)"""
+        try:
+            # Создаем счетчик для сегодняшнего дня
+            today = datetime.now().strftime('%Y-%m-%d')
+            key = f"upstash:commands:{today}"
+            
+            # Получаем текущий счетчик
+            commands_today = self.redis.get(key) or 0
+            
+            # Предупреждение если близко к лимиту
+            if int(commands_today) > 8000:
+                print(f"⚠️  Внимание: использовано {commands_today}/10000 команд сегодня")
+            
+            print(f"📊 Команд сегодня: {commands_today}")
+            
+        except:
+            pass
+    
+    def increment_command_counter(self):
+        """Увеличиваем счетчик команд"""
+        try:
+            today = datetime.now().strftime('%Y-%m-%d')
+            key = f"upstash:commands:{today}"
+            self.redis.incr(key)
+            # Автоматическое удаление через 7 дней
+            self.redis.expire(key, 7 * 86400)
+        except:
+            pass
+    
+    # ========== ОСНОВНЫЕ МЕТОДЫ ДЛЯ БОТА ==========
+    
+    def save_user(self, user_id, user_data):
         """Сохранение данных пользователя"""
-        redis_key = f"user:{user_id}:{key}"
-        self.redis.set(redis_key, json.dumps(value))
-        return True
+        try:
+            self.increment_command_counter()
+            key = f"user:{user_id}"
+            self.redis.hset(key, mapping={
+                "username": user_data.get("username", ""),
+                "first_name": user_data.get("first_name", ""),
+                "last_seen": datetime.now().isoformat(),
+                "message_count": 0
+            })
+            
+            # Устанавливаем TTL 90 дней для автоматической очистки неактивных
+            self.redis.expire(key, 90 * 86400)
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка сохранения пользователя: {e}")
+            return False
     
-    def get_user_data(self, user_id, key):
+    def get_user(self, user_id):
         """Получение данных пользователя"""
-        redis_key = f"user:{user_id}:{key}"
-        data = self.redis.get(redis_key)
-        return json.loads(data) if data else None
+        try:
+            self.increment_command_counter()
+            key = f"user:{user_id}"
+            return self.redis.hgetall(key)
+        except:
+            return {}
     
-    def save_message(self, user_id, message, sender="user"):
-        """Сохранение сообщения в историю"""
-        message_data = {
-            "text": message,
-            "sender": sender,
-            "timestamp": datetime.now().isoformat()
-        }
-        
-        # Добавляем в список последних сообщений
-        redis_key = f"user:{user_id}:messages"
-        self.redis.lpush(redis_key, json.dumps(message_data))
-        self.redis.ltrim(redis_key, 0, 99)  # Храним 100 последних сообщений
-        
-        # Обновляем счетчик сообщений
-        counter_key = f"stats:messages:{datetime.now().strftime('%Y-%m-%d')}"
-        self.redis.incr(counter_key)
-        
-        return True
-    
-    def get_message_history(self, user_id, limit=10):
-        """Получение истории сообщений"""
-        redis_key = f"user:{user_id}:messages"
-        messages = self.redis.lrange(redis_key, 0, limit-1)
-        return [json.loads(msg) for msg in messages]
+    def save_message(self, user_id, message, message_type="text"):
+        """Сохранение сообщения"""
+        try:
+            self.increment_command_counter()
+            
+            # Сохраняем само сообщение
+            message_id = self.redis.incr("global:message_id")
+            message_key = f"message:{message_id}"
+            
+            message_data = {
+                "user_id": user_id,
+                "text": message[:500],  # Ограничиваем длину
+                "type": message_type,
+                "timestamp": datetime.now().isoformat(),
+                "message_id": message_id
+            }
+            
+            self.redis.hset(message_key, mapping=message_data)
+            self.redis.expire(message_key, 30 * 86400)  # 30 дней
+            
+            # Обновляем счетчик сообщений пользователя
+            user_key = f"user:{user_id}"
+            self.redis.hincrby(user_key, "message_count", 1)
+            self.redis.hset(user_key, "last_seen", datetime.now().isoformat())
+            
+            # Добавляем в список последних сообщений пользователя
+            list_key = f"user:{user_id}:messages"
+            self.redis.lpush(list_key, message_id)
+            self.redis.ltrim(list_key, 0, 49)  # Храним 50 последних
+            
+            return message_id
+            
+        except Exception as e:
+            logger.error(f"Ошибка сохранения сообщения: {e}")
+            return None
     
     def get_user_stats(self, user_id):
         """Статистика пользователя"""
-        return {
-            "message_count": self.redis.llen(f"user:{user_id}:messages"),
-            "last_seen": self.redis.get(f"user:{user_id}:last_seen"),
-            "created_at": self.redis.get(f"user:{user_id}:created_at")
-        }
+        try:
+            self.increment_command_counter()
+            user_data = self.get_user(user_id)
+            
+            # Получаем последние сообщения
+            list_key = f"user:{user_id}:messages"
+            last_messages_ids = self.redis.lrange(list_key, 0, 4)  # 5 последних
+            
+            last_messages = []
+            for msg_id in last_messages_ids:
+                msg = self.redis.hgetall(f"message:{msg_id}")
+                if msg:
+                    last_messages.append({
+                        "text": msg.get("text", "")[:50] + "...",
+                        "time": msg.get("timestamp", "")[:16]
+                    })
+            
+            return {
+                "message_count": user_data.get("message_count", 0),
+                "last_seen": user_data.get("last_seen", "никогда"),
+                "username": user_data.get("username", "неизвестно"),
+                "last_messages": last_messages
+            }
+        except:
+            return {}
     
-    def get_bot_stats(self):
-        """Общая статистика бота"""
-        today = datetime.now().strftime('%Y-%m-%d')
-        return {
-            "users_total": len(self.redis.keys("user:*:created_at")),
-            "messages_today": self.redis.get(f"stats:messages:{today}") or 0,
-            "active_today": len(self.redis.keys(f"user:*:last_seen:{today}"))
-        }
+    def get_global_stats(self):
+        """Глобальная статистика бота"""
+        try:
+            self.increment_command_counter()
+            
+            # Подсчитываем пользователей (примерно)
+            user_keys = self.redis.keys("user:*")
+            # Фильтруем только ключи пользователей (не списки сообщений)
+            real_users = [k for k in user_keys if ":messages" not in k]
+            
+            # Сообщения за сегодня
+            today = datetime.now().strftime('%Y-%m-%d')
+            today_messages = 0
+            
+            # Примерный подсчет (для экономии команд)
+            all_messages = self.redis.keys("message:*")
+            for msg_key in all_messages[:100]:  # Проверяем первые 100
+                msg = self.redis.hget(msg_key, "timestamp")
+                if msg and msg.startswith(today):
+                    today_messages += 1
+            
+            return {
+                "total_users": len(real_users),
+                "today_messages": today_messages,
+                "redis_status": "✅ Online" if self.redis else "❌ Offline",
+                "memory_used": self.redis.info("memory")["used_memory_human"]
+            }
+        except Exception as e:
+            return {"error": str(e)}
     
-    def update_last_seen(self, user_id):
-        """Обновление времени последней активности"""
-        today = datetime.now().strftime('%Y-%m-%d')
-        self.redis.set(f"user:{user_id}:last_seen", datetime.now().isoformat())
-        self.redis.set(f"user:{user_id}:last_seen:{today}", "1", ex=86400)
+    def search_users(self, search_term):
+        """Поиск пользователей по имени или username"""
+        try:
+            self.increment_command_counter()
+            results = []
+            
+            # Ищем по всем пользователям
+            user_keys = self.redis.keys("user:*")
+            for key in user_keys:
+                if ":messages" not in key:  # Только ключи пользователей
+                    user_data = self.redis.hgetall(key)
+                    username = user_data.get("username", "").lower()
+                    first_name = user_data.get("first_name", "").lower()
+                    search_term_lower = search_term.lower()
+                    
+                    if (search_term_lower in username or 
+                        search_term_lower in first_name or
+                        search_term in key):
+                        results.append({
+                            "user_id": key.split(":")[1],
+                            "username": user_data.get("username", ""),
+                            "first_name": user_data.get("first_name", ""),
+                            "message_count": user_data.get("message_count", 0)
+                        })
+            
+            return results[:10]  # Ограничиваем 10 результатами
+        except:
+            return []
 
 # Инициализация Redis
-try:
-    storage = RedisStorage(REDIS_URL)
-except Exception as e:
-    logger.error(f"❌ Ошибка подключения к Redis: {e}")
-    storage = None
+redis_manager = None
+if UPSTASH_REDIS_URL:
+    redis_manager = UpstashRedisManager(UPSTASH_REDIS_URL)
+else:
+    print("⚠️  UPSTASH_REDIS_URL не установлен. Redis отключен.")
 
 # ===================== КОМАНДЫ БОТА =====================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /start"""
     user = update.effective_user
     
-    # Сохраняем информацию о пользователе
-    if storage:
-        storage.save_user_data(user.id, "info", {
-            "username": user.username,
-            "first_name": user.first_name,
-            "last_name": user.last_name,
-            "language_code": user.language_code
-        })
-        
-        # Время создания
-        if not storage.get_user_data(user.id, "created_at"):
-            storage.save_user_data(user.id, "created_at", datetime.now().isoformat())
-        
-        storage.update_last_seen(user.id)
-        storage.save_message(user.id, "/start", "command")
+    # Сохраняем пользователя в Redis
+    if redis_manager:
+        user_data = {
+            "username": user.username or "",
+            "first_name": user.first_name or "",
+            "user_id": user.id
+        }
+        redis_manager.save_user(user.id, user_data)
     
     welcome_text = (
         "🤖 *Добро пожаловать!*\n\n"
-        "Я бот с Redis-хранилищем!\n"
-        "Ваши данные теперь сохраняются на сервере.\n\n"
-        "*Доступные команды:*\n"
-        "/profile - Ваш профиль\n"
-        "/stats - Статистика\n"
-        "/history - История сообщений\n"
+        "Этот бот использует *Upstash Redis* для хранения данных.\n\n"
+        "*📊 Доступные команды:*\n"
+        "/profile - Ваша статистика\n"
+        "/stats - Статистика бота\n"
+        "/last - Последние сообщения\n"
+        "/search - Поиск пользователей\n"
         "/admin - Админ-панель\n\n"
-        "Просто напишите мне что-нибудь!"
+        "Все ваши сообщения сохраняются в облаке! 🚀"
     )
     
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
-    logger.info(f"Пользователь {user.id} начал диалог")
+    
+    # Сохраняем факт использования команды
+    if redis_manager:
+        redis_manager.save_message(user.id, "/start", "command")
 
 async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /profile"""
+    """Команда /profile - статистика пользователя"""
     user = update.effective_user
     
-    if storage:
-        storage.update_last_seen(user.id)
-        
-        # Получаем данные из Redis
-        user_info = storage.get_user_data(user.id, "info")
-        stats = storage.get_user_stats(user.id)
+    if redis_manager:
+        stats = redis_manager.get_user_stats(user.id)
         
         profile_text = (
             f"👤 *Ваш профиль*\n"
             f"🆔 ID: `{user.id}`\n"
-            f"📛 Имя: {user_info.get('first_name') if user_info else user.first_name}\n"
-            f"📅 С нами с: {stats.get('created_at', 'сегодня')[:10]}\n"
+            f"📛 Username: @{stats.get('username', user.username or 'нет')}\n"
             f"💬 Сообщений: {stats.get('message_count', 0)}\n"
-            f"🕐 Последний раз: {stats.get('last_seen', 'только что')[:16]}"
+            f"🕐 Последняя активность: {stats.get('last_seen', 'только что')[:16]}\n\n"
+            f"*Последние сообщения:*\n"
         )
         
-        await update.message.reply_text(profile_text, parse_mode="Markdown")
+        for i, msg in enumerate(stats.get("last_messages", []), 1):
+            profile_text += f"{i}. {msg['time']}: {msg['text']}\n"
+        
+        if not stats.get("last_messages"):
+            profile_text += "Пока нет сохраненных сообщений\n"
+        
+        # Добавляем информацию о Redis
+        profile_text += f"\n🔗 Redis: {'✅' if redis_manager.redis else '❌'}"
+        
     else:
-        await update.message.reply_text("❌ Хранилище недоступно")
+        profile_text = "❌ Redis не доступен. Данные не сохраняются."
+    
+    await update.message.reply_text(profile_text, parse_mode="Markdown")
+    
+    if redis_manager:
+        redis_manager.save_message(user.id, "/profile", "command")
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /stats"""
-    if storage:
-        stats = storage.get_bot_stats()
+    """Команда /stats - статистика бота"""
+    if redis_manager:
+        stats = redis_manager.get_global_stats()
         
         stats_text = (
-            "📊 *Статистика бота*\n\n"
-            f"👥 Пользователей: {stats['users_total']}\n"
-            f"💬 Сообщений сегодня: {stats['messages_today']}\n"
-            f"🎯 Активных сегодня: {stats['active_today']}\n\n"
-            f"🔄 Redis: {'✅' if storage.redis.ping() else '❌'}"
+            "📊 *Глобальная статистика бота*\n\n"
+            f"👥 Всего пользователей: {stats.get('total_users', 0)}\n"
+            f"💬 Сообщений сегодня: {stats.get('today_messages', 0)}\n"
+            f"🧠 Использовано памяти: {stats.get('memory_used', 'N/A')}\n"
+            f"🔗 Статус Redis: {stats.get('redis_status', 'N/A')}\n\n"
+            f"⚡ *Upstash Redis*\n"
+            f"• Бесплатно: 10,000 команд/день\n"
+            f"• Данные хранятся 90 дней\n"
+            f"• Автоматическое масштабирование"
         )
-        
-        await update.message.reply_text(stats_text, parse_mode="Markdown")
     else:
-        await update.message.reply_text("❌ Статистика недоступна")
+        stats_text = "❌ Redis не настроен. Добавьте UPSTASH_REDIS_URL в переменные."
+    
+    await update.message.reply_text(stats_text, parse_mode="Markdown")
+    
+    if redis_manager and update.effective_user:
+        redis_manager.save_message(update.effective_user.id, "/stats", "command")
 
-async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /history - история сообщений"""
+async def last_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /last - последние сообщения"""
     user = update.effective_user
     
-    if storage:
-        history = storage.get_message_history(user.id, limit=5)
+    if redis_manager:
+        stats = redis_manager.get_user_stats(user.id)
         
-        if history:
-            history_text = "📜 *Последние 5 сообщений:*\n\n"
-            for msg in reversed(history):  # Новые сверху
-                time = datetime.fromisoformat(msg['timestamp']).strftime('%H:%M')
-                sender = "Вы" if msg['sender'] == "user" else "Бот"
-                history_text += f"🕐 {time} | {sender}: {msg['text'][:50]}...\n"
+        if stats.get("last_messages"):
+            last_text = "📜 *Ваши последние сообщения:*\n\n"
+            for i, msg in enumerate(stats.get("last_messages", []), 1):
+                last_text += f"*{i}.* `{msg['time']}`\n{msg['text']}\n\n"
         else:
-            history_text = "📜 История сообщений пуста"
-        
-        await update.message.reply_text(history_text, parse_mode="Markdown")
+            last_text = "📜 У вас пока нет сохраненных сообщений."
     else:
-        await update.message.reply_text("❌ История недоступна")
+        last_text = "❌ Redis не доступен."
+    
+    await update.message.reply_text(last_text, parse_mode="Markdown")
+    
+    if redis_manager:
+        redis_manager.save_message(user.id, "/last", "command")
 
-async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /admin - только для админа"""
+async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /search - поиск пользователей (админ)"""
     user = update.effective_user
     admin_id = os.environ.get("ADMIN_ID")
     
-    if str(user.id) != admin_id:
+    # Проверяем права админа
+    if admin_id and str(user.id) != admin_id:
         await update.message.reply_text("❌ Эта команда только для администратора")
         return
     
-    if storage:
-        # Получаем все ключи из Redis для отладки
-        keys = storage.redis.keys("*")
+    if not context.args:
+        await update.message.reply_text("Используйте: /search <имя или username>")
+        return
+    
+    search_term = " ".join(context.args)
+    
+    if redis_manager:
+        results = redis_manager.search_users(search_term)
         
-        admin_text = (
-            "🛠️ *Админ-панель*\n\n"
-            f"🔑 Всего ключей в Redis: {len(keys)}\n"
-            f"💾 Использовано памяти: {storage.redis.info('memory')['used_memory_human']}\n"
-            f"⚡ Подключений: {storage.redis.info('clients')['connected_clients']}\n\n"
-            "*Последние 10 ключей:*\n"
-        )
-        
-        for key in keys[:10]:
-            admin_text += f"• {key}\n"
-        
-        await update.message.reply_text(admin_text, parse_mode="Markdown")
+        if results:
+            search_text = f"🔍 *Результаты поиска '{search_term}':*\n\n"
+            for i, result in enumerate(results, 1):
+                search_text += (
+                    f"*{i}.* ID: `{result['user_id']}`\n"
+                    f"   👤 {result['first_name']} (@{result['username'] or 'нет'})\n"
+                    f"   💬 Сообщений: {result['message_count']}\n\n"
+                )
+        else:
+            search_text = f"🔍 По запросу '{search_term}' ничего не найдено."
     else:
-        await update.message.reply_text("❌ Redis недоступен")
+        search_text = "❌ Redis не доступен."
+    
+    await update.message.reply_text(search_text, parse_mode="Markdown")
+    
+    if redis_manager:
+        redis_manager.save_message(user.id, f"/search {search_term}", "command")
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /admin - админ-панель"""
+    user = update.effective_user
+    admin_id = os.environ.get("ADMIN_ID")
+    
+    if admin_id and str(user.id) != admin_id:
+        await update.message.reply_text("❌ Нет доступа")
+        return
+    
+    admin_text = (
+        "🛠️ *Админ-панель*\n\n"
+        "*Доступные команды:*\n"
+        "/search <текст> - поиск пользователей\n"
+        "/broadcast <текст> - рассылка\n"
+        "/stats - статистика\n\n"
+        "*Upstash Redis:*\n"
+        "• Команд сегодня: (см /stats)\n"
+        "• Память: (см /stats)\n"
+        "• Пользователей: (см /stats)"
+    )
+    
+    await update.message.reply_text(admin_text, parse_mode="Markdown")
+    
+    if redis_manager:
+        redis_manager.save_message(user.id, "/admin", "command")
+
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /broadcast - рассылка (админ)"""
+    user = update.effective_user
+    admin_id = os.environ.get("ADMIN_ID")
+    
+    if admin_id and str(user.id) != admin_id:
+        await update.message.reply_text("❌ Нет доступа")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Используйте: /broadcast <текст сообщения>")
+        return
+    
+    if not redis_manager:
+        await update.message.reply_text("❌ Redis не доступен")
+        return
+    
+    broadcast_text = " ".join(context.args)
+    
+    # Получаем всех пользователей
+    user_keys = redis_manager.redis.keys("user:*")
+    real_users = [k for k in user_keys if ":messages" not in k]
+    
+    if not real_users:
+        await update.message.reply_text("❌ Нет пользователей для рассылки")
+        return
+    
+    await update.message.reply_text(f"📢 Рассылка {len(real_users)} пользователям...")
+    
+    success = 0
+    for user_key in real_users[:50]:  # Ограничиваем 50 пользователями за раз
+        try:
+            user_id = user_key.split(":")[1]
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"📢 *Сообщение от администратора:*\n\n{broadcast_text}",
+                parse_mode="Markdown"
+            )
+            success += 1
+        except:
+            pass
+    
+    await update.message.reply_text(f"✅ Отправлено {success}/{len(real_users)} пользователям")
+    
+    redis_manager.save_message(user.id, f"/broadcast {broadcast_text[:50]}...", "command")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка обычных сообщений"""
@@ -223,89 +464,59 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Сообщение от {user.id}: {message}")
     
     # Сохраняем в Redis
-    if storage:
-        storage.save_message(user.id, message, "user")
-        storage.update_last_seen(user.id)
+    if redis_manager:
+        message_id = redis_manager.save_message(user.id, message, "text")
         
-        # Пример: отвечаем эхом с сохранением
-        response = f"Вы сказали: {message}"
-        storage.save_message(user.id, response, "bot")
-        
-        await update.message.reply_text(response)
+        if message_id:
+            # Отвечаем с подтверждением
+            response = f"✅ Сообщение #{message_id} сохранено в Upstash Redis!"
+            await update.message.reply_text(response)
+        else:
+            await update.message.reply_text("📝 Сообщение получено (ошибка сохранения)")
     else:
-        await update.message.reply_text("Сообщение получено (Redis недоступен)")
-
-async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /broadcast - рассылка всем пользователям (админ)"""
-    user = update.effective_user
-    admin_id = os.environ.get("ADMIN_ID")
-    
-    if str(user.id) != admin_id:
-        await update.message.reply_text("❌ Только для администратора")
-        return
-    
-    if not context.args:
-        await update.message.reply_text("Используйте: /broadcast текст сообщения")
-        return
-    
-    broadcast_text = " ".join(context.args)
-    
-    if storage:
-        # Находим всех пользователей
-        user_keys = storage.redis.keys("user:*:created_at")
-        user_ids = [key.split(":")[1] for key in user_keys]
-        
-        await update.message.reply_text(f"📢 Рассылка {len(user_ids)} пользователям...")
-        
-        # Отправляем каждому
-        success = 0
-        for user_id in user_ids:
-            try:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=f"📢 *Важное сообщение от администратора:*\n\n{broadcast_text}",
-                    parse_mode="Markdown"
-                )
-                success += 1
-            except:
-                pass
-        
-        await update.message.reply_text(f"✅ Отправлено {success}/{len(user_ids)} пользователям")
-    else:
-        await update.message.reply_text("❌ Redis недоступен")
+        await update.message.reply_text("📝 Сообщение получено (Redis отключен)")
 
 # ===================== ОСНОВНАЯ ФУНКЦИЯ =====================
 def main():
     """Запуск бота"""
-    print("=" * 50)
-    print("🤖 TELEGRAM BOT WITH REDIS")
-    print("=" * 50)
+    print("=" * 60)
+    print("🤖 TELEGRAM BOT WITH UPSTASH REDIS")
+    print("=" * 60)
     
     if not BOT_TOKEN:
-        print("❌ ERROR: BOT_TOKEN not found!")
-        print("Add BOT_TOKEN in Railway Variables")
+        print("❌ ОШИБКА: BOT_TOKEN не найден!")
+        print("Добавьте BOT_TOKEN в Railway Variables")
         return
     
     print(f"✅ Bot Token: {BOT_TOKEN[:15]}...")
-    print(f"🔗 Redis URL: {REDIS_URL}")
-    print("=" * 50)
+    print(f"🔗 Redis URL: {'SET' if UPSTASH_REDIS_URL else 'NOT SET'}")
+    print("=" * 60)
     
-    # Создаем приложение
-    app = Application.builder().token(BOT_TOKEN).build()
-    
-    # Добавляем команды
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("profile", profile_command))
-    app.add_handler(CommandHandler("stats", stats_command))
-    app.add_handler(CommandHandler("history", history_command))
-    app.add_handler(CommandHandler("admin", admin_command))
-    app.add_handler(CommandHandler("broadcast", broadcast_command))
-    
-    # Обработчик сообщений
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    print("🚀 Bot starting...")
-    app.run_polling(drop_pending_updates=True)
+    try:
+        # Создаем приложение
+        app = Application.builder().token(BOT_TOKEN).build()
+        
+        # Добавляем команды
+        app.add_handler(CommandHandler("start", start_command))
+        app.add_handler(CommandHandler("profile", profile_command))
+        app.add_handler(CommandHandler("stats", stats_command))
+        app.add_handler(CommandHandler("last", last_command))
+        app.add_handler(CommandHandler("search", search_command))
+        app.add_handler(CommandHandler("admin", admin_command))
+        app.add_handler(CommandHandler("broadcast", broadcast_command))
+        
+        # Обработчик обычных сообщений
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        
+        print("🚀 Бот запускается...")
+        print("📡 Ожидание сообщений...")
+        print("=" * 60)
+        
+        app.run_polling(drop_pending_updates=True)
+        
+    except Exception as e:
+        logger.error(f"Ошибка запуска бота: {e}")
+        print(f"❌ Критическая ошибка: {e}")
 
 if __name__ == "__main__":
     main()
